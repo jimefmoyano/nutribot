@@ -1,0 +1,209 @@
+// ============================================================
+//  Bot de Registro de Alimentación y Actividad — Telegram
+//  Google Apps Script
+//
+//  Antes de deployar, reemplazá las constantes de configuración
+//  con tus propios valores (ver sección CONFIG más abajo).
+// ============================================================
+
+// ── CONFIG ───────────────────────────────────────────────────
+const TELEGRAM_TOKEN   = 'TU_TOKEN_AQUI';           // @BotFather
+const SPREADSHEET_ID   = 'ID_DE_TU_GOOGLE_SHEET';
+const FOLDER_ID        = 'ID_DE_TU_CARPETA_EN_DRIVE';
+// ─────────────────────────────────────────────────────────────
+
+const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+
+// ── WEBHOOK PRINCIPAL ─────────────────────────────────────────
+function doPost(e) {
+  const contents = JSON.parse(e.postData.contents);
+  const chatId   = contents.message.chat.id;
+  const text     = contents.message.text;
+  const photo    = contents.message.photo;
+
+  const props       = PropertiesService.getScriptProperties();
+  const storedState = props.getProperty(chatId);
+  const chatState   = storedState ? JSON.parse(storedState) : { step: 0, data: {} };
+
+  const textoLimpio = text ? text.toLowerCase() : '';
+
+  // Comandos globales: reiniciar en cualquier momento
+  if (textoLimpio === 'reiniciar' || textoLimpio === 'cancelar') {
+    props.deleteProperty(chatId);
+    sendMessage(chatId, '¡Listo! Empezamos de nuevo. ¿Qué tipo de comida o actividad querés registrar?\nPodés elegir entre: desayuno, almuerzo, merienda, cena, caminata, otras actividades.');
+    chatState.step = 1;
+    props.setProperty(chatId, JSON.stringify(chatState));
+    return;
+  }
+
+  switch (chatState.step) {
+
+    // ── INICIO ──────────────────────────────────────────────
+    case 0:
+      sendMessage(chatId, '¿Qué tipo de comida o actividad querés registrar?\nPodés elegir entre: desayuno, almuerzo, merienda, cena, caminata, otras actividades.');
+      chatState.step = 1;
+      break;
+
+    // ── TIPO DE REGISTRO ────────────────────────────────────
+    case 1:
+      chatState.data.tipoComida = text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
+
+      if (textoLimpio === 'caminata') {
+        sendMessage(chatId, '¿Cuántos pasos diste?');
+        chatState.step = 10;
+      } else if (textoLimpio === 'otras actividades') {
+        sendMessage(chatId, '¿Qué actividad realizaste?');
+        chatState.step = 20;
+      } else {
+        sendMessage(chatId, '¿Podrías describir brevemente lo que comiste?');
+        chatState.step = 2;
+      }
+      break;
+
+    // ── FLUJO COMIDA (steps 2-4) ────────────────────────────
+    case 2:
+      chatState.data.descripcion = text;
+      sendMessage(chatId, '¿A qué hora comiste? (Formato HH:MM)');
+      chatState.step = 3;
+      break;
+
+    case 3:
+      chatState.data.hora = text;
+      sendMessage(chatId, 'Por favor, envíame una foto de la comida.');
+      chatState.step = 4;
+      break;
+
+    case 4:
+      if (photo && photo.length > 0) {
+        // Subir foto a Drive y obtener link directo
+        const fileId    = photo[photo.length - 1].file_id;
+        const fileUrl   = getFileUrl(fileId);
+        const imageBlob = UrlFetchApp.fetch(fileUrl).getBlob();
+        const folder    = DriveApp.getFolderById(FOLDER_ID);
+        const file      = folder.createFile(imageBlob);
+        const urlFoto   = file.getUrl();
+
+        const fileIdMatch     = urlFoto.match(/[-\w]{25,}/);
+        const fileIdExtracted = fileIdMatch ? fileIdMatch[0] : '';
+        const linkFotoDirecta = `https://drive.google.com/uc?export=view&id=${fileIdExtracted}`;
+
+        chatState.data.urlFoto       = urlFoto;
+        chatState.data.idFoto        = fileIdExtracted;
+        chatState.data.linkFotoDirecta = linkFotoDirecta;
+
+        // Fecha y día
+        const fecha      = new Date();
+        const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+        chatState.data.fecha    = Utilities.formatDate(fecha, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+        chatState.data.diaSemana = diasSemana[fecha.getDay()];
+
+        // Guardar en Sheet
+        const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getActiveSheet();
+        sheet.appendRow([
+          chatState.data.fecha,
+          chatState.data.diaSemana,
+          chatState.data.hora            || '',
+          chatState.data.tipoComida      || '',
+          chatState.data.descripcion     || '',
+          chatState.data.urlFoto         || '',
+          chatState.data.idFoto          || '',
+          chatState.data.linkFotoDirecta || '',
+          '', '', '', '', ''   // pasos, tiempo, km, actividad, rutina
+        ]);
+
+        sendMessage(chatId, '¡Gracias! Tu registro fue guardado con éxito.');
+        props.deleteProperty(chatId);
+      } else {
+        sendMessage(chatId, 'Por favor, envíame una foto válida de la comida.');
+      }
+      break;
+
+    // ── FLUJO CAMINATA (steps 10-12) ────────────────────────
+    case 10:
+      chatState.data.pasos = text;
+      sendMessage(chatId, '¿Cuánto tiempo caminaste? (ej. 30 minutos)');
+      chatState.step = 11;
+      break;
+
+    case 11:
+      chatState.data.tiempo = text;
+      sendMessage(chatId, '¿Cuántos kilómetros recorriste?');
+      chatState.step = 12;
+      break;
+
+    case 12: {
+      chatState.data.km = text;
+
+      const fecha      = new Date();
+      const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+      chatState.data.fecha     = Utilities.formatDate(fecha, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+      chatState.data.diaSemana = diasSemana[fecha.getDay()];
+
+      const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getActiveSheet();
+      sheet.appendRow([
+        chatState.data.fecha,
+        chatState.data.diaSemana,
+        '', '', '', '', '', '',          // hora → link foto
+        chatState.data.pasos  || '',
+        chatState.data.tiempo || '',
+        chatState.data.km     || '',
+        '', ''                           // actividad, rutina
+      ]);
+
+      sendMessage(chatId, '¡Gracias! Caminata registrada correctamente.');
+      props.deleteProperty(chatId);
+      break;
+    }
+
+    // ── FLUJO OTRAS ACTIVIDADES (steps 20-21) ───────────────
+    case 20:
+      chatState.data.actividad = text;
+      sendMessage(chatId, 'Describí la rutina.');
+      chatState.step = 21;
+      break;
+
+    case 21: {
+      chatState.data.rutina = text;
+
+      const fecha      = new Date();
+      const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+      chatState.data.fecha     = Utilities.formatDate(fecha, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+      chatState.data.diaSemana = diasSemana[fecha.getDay()];
+
+      const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getActiveSheet();
+      sheet.appendRow([
+        chatState.data.fecha,
+        chatState.data.diaSemana,
+        '', '', '', '', '', '', '', '', '',   // hora → km
+        chatState.data.actividad || '',
+        chatState.data.rutina    || ''
+      ]);
+
+      sendMessage(chatId, '¡Gracias! Actividad registrada correctamente.');
+      props.deleteProperty(chatId);
+      break;
+    }
+
+    default:
+      sendMessage(chatId, 'Ha ocurrido un error. Por favor, iniciá nuevamente.');
+      props.deleteProperty(chatId);
+      break;
+  }
+
+  props.setProperty(chatId, JSON.stringify(chatState));
+}
+
+// ── HELPERS ───────────────────────────────────────────────────
+function sendMessage(chatId, text) {
+  UrlFetchApp.fetch(`${TELEGRAM_API_URL}/sendMessage`, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ chat_id: chatId, text: text })
+  });
+}
+
+function getFileUrl(fileId) {
+  const response = UrlFetchApp.fetch(`${TELEGRAM_API_URL}/getFile?file_id=${fileId}`);
+  const filePath = JSON.parse(response.getContentText()).result.file_path;
+  return `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
+}
